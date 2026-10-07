@@ -80,8 +80,6 @@ export default function Home() {
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [cloudStatus, setCloudStatus] = useState<"local" | "connecting" | "connected" | "signedout" | "error">(isSupabaseConfigured ? "connecting" : "local");
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authUserId, setAuthUserId] = useState<string | null>(null);
@@ -189,28 +187,13 @@ export default function Home() {
     await initializeSupabase();
   }
 
-  async function signInWithEmail(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function signInWithGoogle() {
     if (!supabase) return notify("ใส่ Supabase URL และ Publishable Key ใน .env ก่อน");
     setAuthBusy(true);
     try {
-      const { error } = await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword });
-      if (error) notify(`เข้าสู่ระบบไม่สำเร็จ: ${error.message}`);
-      else await refreshSupabaseWorkspace();
-    } catch (error) { notify(error instanceof Error ? error.message : "เข้าสู่ระบบไม่สำเร็จ"); }
-    finally { setAuthBusy(false); }
-  }
-
-  async function signUpWithEmail() {
-    if (!supabase) return notify("ใส่ Supabase URL และ Publishable Key ใน .env ก่อน");
-    if (!authEmail.trim() || authPassword.length < 6) return notify("กรอกอีเมลและรหัสผ่านอย่างน้อย 6 ตัวอักษร");
-    setAuthBusy(true);
-    try {
-      const { data, error } = await supabase.auth.signUp({ email: authEmail.trim(), password: authPassword, options: { emailRedirectTo: window.location.origin } });
-      if (error) notify(`สมัครบัญชีไม่สำเร็จ: ${error.message}`);
-      else if (data.session) await refreshSupabaseWorkspace();
-      else notify("สมัครบัญชีแล้ว กรุณาตรวจอีเมลและกดยืนยัน ก่อนกลับมาเข้าสู่ระบบ");
-    } catch (error) { notify(error instanceof Error ? error.message : "สมัครบัญชีไม่สำเร็จ"); }
+      const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
+      if (error) notify(`เข้าสู่ระบบด้วย Google ไม่สำเร็จ: ${error.message}`);
+    } catch (error) { notify(error instanceof Error ? error.message : "เข้าสู่ระบบด้วย Google ไม่สำเร็จ"); }
     finally { setAuthBusy(false); }
   }
 
@@ -471,12 +454,8 @@ export default function Home() {
     {toast && <div className="workspace-notice warning">{toast}</div>}
     {!isSupabaseConfigured ? <div className="workspace-notice warning">ยังไม่ได้ตั้งค่า Supabase กรุณาเพิ่ม Supabase URL และ Publishable Key ในไฟล์ .env แล้วเริ่มระบบใหม่</div> : cloudStatus === "connecting" ? <div className="workspace-notice">กำลังตรวจสอบสถานะการเข้าสู่ระบบ…</div> : <>
       {cloudStatus === "error" && <div className="workspace-notice warning">เชื่อมต่อ Supabase ไม่สำเร็จ กรุณาตรวจ URL, Key และการเชื่อมต่อ แล้วลองใหม่</div>}
-      <form className="email-auth-form auth-gate-form" onSubmit={signInWithEmail}>
-        <label htmlFor="gate-email">อีเมล</label><input id="gate-email" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" required />
-        <label htmlFor="gate-password">รหัสผ่าน</label><input id="gate-password" type="password" autoComplete="current-password" minLength={6} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="อย่างน้อย 6 ตัวอักษร" required />
-        <div className="email-auth-actions"><button className="primary-button" disabled={authBusy}>{authBusy ? "กำลังดำเนินการ…" : "เข้าสู่ระบบ"}</button><button type="button" className="secondary-button" disabled={authBusy} onClick={() => void signUpWithEmail()}>สมัครบัญชีใหม่</button></div>
-      </form>
-      <small className="auth-gate-hint">การสมัครอาจต้องยืนยันอีเมลก่อนเข้าสู่ระบบ</small>
+      <button type="button" className="google-signin-button" disabled={authBusy} onClick={() => void signInWithGoogle()}><span className="google-g-mark">G</span>{authBusy ? "กำลังเชื่อมต่อ Google…" : "เข้าสู่ระบบด้วย Google"}</button>
+      <small className="auth-gate-hint">ใช้บัญชี Google เพื่อเข้าสู่ระบบโดยไม่ต้องรออีเมลยืนยันจาก Supabase</small>
     </>}
   </section></main>;
 
@@ -518,7 +497,6 @@ export default function Home() {
 
         {tab !== "chat" && tab !== "workspace" && <ProcessStepper busy={busy} supervisor={project.supervisor} approvedPlan={project.approvedPlan} worker={project.worker} />}
 
-        {tab === "workspace" && cloudStatus === "signedout" && <div className="email-auth-card"><h3>เข้าสู่ระบบเพื่อซิงก์บทสนทนา</h3><p>ใช้บัญชีอีเมลและรหัสผ่านเพื่อเปิดประวัติจาก Supabase</p><form className="email-auth-form" onSubmit={signInWithEmail}><label htmlFor="auth-email">อีเมล</label><input id="auth-email" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" required /><label htmlFor="auth-password">รหัสผ่าน</label><input id="auth-password" type="password" autoComplete="current-password" minLength={6} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="อย่างน้อย 6 ตัวอักษร" required /><div className="email-auth-actions"><button className="primary-button" disabled={authBusy}>{authBusy ? "กำลังดำเนินการ…" : "เข้าสู่ระบบ"}</button><button type="button" className="secondary-button" disabled={authBusy} onClick={() => void signUpWithEmail()}>สมัครบัญชีใหม่</button></div></form><small>ถ้าสมัครแล้ว ระบบอาจส่งลิงก์ยืนยันไปยังอีเมลก่อนเข้าสู่ระบบได้</small></div>}
         {tab === "workspace" && cloudStatus === "local" && <div className="workspace-notice">เพิ่มค่า Supabase ใน .env เพื่อเปิดการซิงก์บน Cloud</div>}
         {tab === "workspace" && cloudStatus === "error" && <div className="workspace-notice warning">ซิงก์ Supabase ไม่สำเร็จ ข้อมูลในเครื่องยังใช้งานได้ <button className="secondary-button" onClick={() => void refreshSupabaseWorkspace()}>ลองเชื่อมต่อใหม่</button></div>}
         {tab === "workspace" ? <section className="workspace-page"><div className="workspace-page-heading"><div><span className="workspace-icon">▦</span><div><h2>บทสนทนาที่บันทึกไว้</h2><p>เปิดงานเดิมเพื่อย้อนกลับไปอ่านและคุยต่อกับ Supervisor</p></div></div><button className="primary-button" onClick={startConversation}>＋ เริ่มบทสนทนาใหม่</button></div>{cloudStatus === "connecting" && <div className="workspace-notice">กำลังโหลดรายการจาก Supabase…</div>}{cloudStatus === "error" && <div className="workspace-notice warning">Supabase ยังเชื่อมต่อไม่ได้ รายการที่บันทึกในเครื่องยังเปิดได้</div>}{conversations.length ? <div className="conversation-list">{conversations.map((conversation) => <button className={`conversation-item ${conversation.id === activeConversationId ? "current" : ""}`} key={conversation.id} onClick={() => openConversation(conversation)}><span className="conversation-icon">▤</span><span className="conversation-item-main"><strong>{conversation.title}</strong><small>{conversation.state.messages.filter((message) => message.role === "user").length} ข้อความจากคุณ · {conversation.state.worker?.artifact.filename || (conversation.state.supervisor?.status === "needs_clarification" ? "รอคำตอบ Supervisor" : "ยังไม่มีผลงาน")}</small></span><span className="conversation-date">{new Date(conversation.updatedAt).toLocaleString("th-TH", { dateStyle: "medium", timeStyle: "short" })}</span><span className="conversation-open">เปิด →</span></button>)}</div> : <div className="workspace-empty"><span>▤</span><strong>ยังไม่มีบทสนทนาที่บันทึก</strong><p>เริ่มคุยกับ Supervisor แล้วบทสนทนาจะปรากฏที่นี่</p><button className="secondary-button" onClick={startConversation}>เริ่มบทสนทนาแรก</button></div>}</section> : tab === "chat" ? <section className="panel chat-workspace">
@@ -584,7 +562,6 @@ export default function Home() {
         <p className="landing-subtitle">พิมพ์สิ่งที่ต้องการเหมือนคุยกับ chatbot<br className="desktop-break" /> Supervisor จะถามเพิ่ม แล้วส่งคำตอบหรือไฟล์กลับมาให้</p>
         <form className="landing-form" onSubmit={submitGoal}><textarea autoFocus value={request} onChange={(event) => setRequest(event.target.value)} placeholder="เช่น อยากได้สรุปข้อมูลการลงทุน..." rows={4} required /><div className="landing-form-footer"><span>✧ ไม่ต้องเขียน Prompt ให้สมบูรณ์ — Supervisor จะถามเพิ่มถ้าจำเป็น</span><button className="primary-button" disabled={!request.trim() || Boolean(busy)}>{busy === "supervisor" ? <><span className="spinner light" /> กำลังวิเคราะห์</> : <>เริ่มจัดการงาน <span>→</span></>}</button></div></form>
         <div className="landing-examples"><span>ลองเริ่มจาก</span>{["สรุปข้อมูลการลงทุน", "วางแผนทริป 3 วัน", "ทำเว็บแนะนำคาเฟ่"].map((example) => <button key={example} onClick={() => setRequest(example)}>{example} <span>↗</span></button>)}</div>
-        {isSupabaseConfigured && <button className="landing-history-button" onClick={() => setTab("workspace")}>เข้าสู่ระบบด้วยอีเมลเพื่อซิงก์บทสนทนา</button>}
         {conversations.length > 0 && <button className="landing-history-button" onClick={showWorkspace}>▤ กลับไปเปิดบทสนทนาเดิม ({conversations.length})</button>}
         {busy === "supervisor" && <ProgressPanel busy="supervisor" />}
         <div className="landing-trust"><span>◈</span> คุณเป็นผู้สั่งการ — ระบบจะขออนุมัติก่อนเริ่มทำและก่อนส่งมอบ</div>

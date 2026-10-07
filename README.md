@@ -31,18 +31,21 @@ npm install
 npm run dev
 ```
 
-เปิด `http://localhost:3000` แล้วรัน SQL migration ใน `supabase/migrations/202610070001_create_concierge_conversations.sql` ที่ Supabase SQL Editor จากนั้นไปที่ Authentication → Sign In / Providers แล้วเปิด Email provider ใน Supabase ไม่ต้องตั้งค่า Google OAuth
+เปิด `http://localhost:3000` แล้วรัน SQL migration ใน `supabase/migrations/202610070001_create_concierge_conversations.sql` ที่ Supabase SQL Editor จากนั้นตั้ง Google OAuth:
 
-ตั้งค่า Authentication → URL Configuration ให้ Site URL เป็น `http://localhost:3000` และเพิ่ม Redirect URL `http://localhost:3000/**` เพื่อให้ลิงก์ยืนยันอีเมลกลับเข้าแอปได้ ผู้ใช้สมัครด้วยอีเมลและรหัสผ่านจากหน้า Workspace; หากเปิด Email confirmations ไว้ ต้องกดยืนยันจากอีเมลก่อนเข้าสู่ระบบ
+1. สร้าง OAuth Client ID ประเภท Web application ใน Google Cloud แล้วตั้ง Authorized JavaScript origins เป็น `http://localhost:3000` และโดเมน Vercel ของแอป
+2. ตั้ง Authorized redirect URI เป็น callback URL ที่ Supabase แสดงให้ใน Authentication → Sign In / Providers → Google โดยทั่วไปเป็น `https://<project-ref>.supabase.co/auth/v1/callback`
+3. เปิด Google provider ใน Supabase แล้วนำ Client ID และ Client Secret ไปใส่ในช่องของ Google provider นั้น
+4. ใน Supabase Authentication → URL Configuration ตั้ง Site URL เป็นโดเมน production และเพิ่ม `http://localhost:3000/**`, โดเมน production และโดเมน Preview ของ Vercel ใน Redirect URLs
 
-ผู้ใช้ต้องสมัครหรือเข้าสู่ระบบด้วยอีเมลและรหัสผ่านก่อนจึงจะเข้าถึง Workspace ได้ เมื่อกำหนด Supabase URL และ publishable key แล้ว Workspace จะซิงก์บทสนทนาของบัญชีนั้นและเปิดงานเก่ากลับมาคุยต่อได้ แคชใน browser แยกตาม user ID หาก Supabase ยังไม่พร้อม ระบบจะแสดงหน้าตั้งค่า/ข้อผิดพลาดและไม่เปิด Workspace
+ผู้ใช้ต้องเข้าสู่ระบบด้วย Google ก่อนจึงจะเข้าถึง Workspace ได้ เมื่อกำหนด Supabase URL และ publishable key แล้ว Workspace จะซิงก์บทสนทนาของบัญชีนั้นและเปิดงานเก่ากลับมาคุยต่อได้ แคชใน browser แยกตาม user ID หาก Supabase ยังไม่พร้อม ระบบจะแสดงหน้าตั้งค่า/ข้อผิดพลาดและไม่เปิด Workspace
 
 ## เทคโนโลยี
 
 - Next.js App Router และ React
 - Gemini Flash ผ่าน Gemini `generateContent` API
 - HTML preview แสดงใน iframe ที่ใช้ sandbox
-- Supabase Auth ด้วยอีเมล/รหัสผ่าน และตาราง `concierge_conversations` ที่ป้องกันด้วย Row Level Security
+- Supabase Auth ผ่าน Google OAuth และตาราง `concierge_conversations` ที่ป้องกันด้วย Row Level Security
 - local storage สำหรับ cache และ fallback เมื่อยังเชื่อม Supabase ไม่ได้
 
 ถ้ายังไม่ได้ตั้ง `GEMINI_API_KEY` เว็บจะแสดงข้อความแจ้งเตือนเมื่อลองเรียก AI และไม่เปิดเผย key ไปยัง browser
