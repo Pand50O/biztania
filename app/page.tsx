@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
+import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 type Step = { title: string; description: string };
 type SupervisorResult = { status: "needs_clarification" | "ready"; summary: string; questions: string[]; plan: Step[] };
@@ -20,10 +21,25 @@ type Project = {
   messages: Message[];
   activities: Activity[];
 };
-type Tab = "chat" | "supervisor" | "worker";
+type SavedConversation = { id: string; title: string; state: Project; updatedAt: string };
+type Tab = "workspace" | "chat" | "supervisor" | "worker";
 
 const KEY = "promptbridge-concierge-v3";
+const CONVERSATIONS_KEY = "promptbridge-conversations-v1";
+const ACTIVE_CONVERSATION_KEY = "promptbridge-active-conversation-v1";
 const blankProject = (): Project => ({ request: "", answer: "", supervisor: null, worker: null, pendingFeedback: "", approvedPlan: false, messages: [], activities: [] });
+const accountStorageKey = (key: string, userId: string) => `${key}:user:${userId}`;
+function conversationTitle(project: Project) {
+  return (project.request.trim().replace(/\s+/g, " ").slice(0, 72) || "บทสนทนาใหม่");
+}
+
+async function ensureSupabaseUserId(): Promise<string> {
+  if (!supabase) throw new Error("Supabase ยังไม่ได้ตั้งค่า");
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw error;
+  if (!data.session?.user) throw new Error("กรุณาเข้าสู่ระบบก่อนซิงก์บทสนทนา");
+  return data.session.user.id;
+}
 
 function parseCsvPreview(source: string) {
   const rows: string[][] = [];
@@ -57,47 +73,152 @@ export default function Home() {
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState("");
   const [refineOpen, setRefineOpen] = useState(false);
+  const [webArtifactView, setWebArtifactView] = useState<"preview" | "code">("preview");
   const [busy, setBusy] = useState<"supervisor" | "worker" | "qa" | null>(null);
   const [ready, setReady] = useState(false);
   const [toast, setToast] = useState("");
+  const [conversations, setConversations] = useState<SavedConversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<"local" | "connecting" | "connected" | "signedout" | "error">(isSupabaseConfigured ? "connecting" : "local");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authUserId, setAuthUserId] = useState<string | null>(null);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(KEY);
-      if (raw) {
-        const saved = JSON.parse(raw) as Partial<Project>;
-        const activities = (saved.activities || []).map((item) => item.title === "Worker ปรับ Draft และ Supervisor ตรวจแล้ว"
-          ? { ...item, title: "Supervisor รับ Feedback → มอบหมาย Worker" }
-          : item.title === "Worker สร้าง Draft และ Supervisor ตรวจแล้ว"
-            ? { ...item, title: "Supervisor มอบหมาย Worker → QA ตรวจ" }
-            : item.title === "Worker ส่งผลงานกลับมา"
-              ? { ...item, title: "Supervisor รับผลจาก Worker และส่งมอบ" }
-              : item);
-        const messages = (saved.messages || []).map((message) => message.role === "assistant" && message.label === "ผลลัพธ์จาก Supervisor"
-          ? { ...message, actor: "worker" as const, label: "Worker ส่งผลงานกลับมาให้ Supervisor" }
-          : message);
-        if (saved.supervisor?.status === "ready" && !messages.some((message) => message.actor === "supervisor" && message.label.includes("สั่ง Worker"))) {
-          const orderMessage: Message = { role: "assistant", actor: "supervisor", label: "Supervisor สั่ง Worker", text: formatSupervisorOrder(saved.supervisor) };
-          const workerIndex = messages.findIndex((message) => message.actor === "worker");
-          messages.splice(workerIndex < 0 ? messages.length : workerIndex, 0, orderMessage);
-        }
-        if (saved.worker && !messages.some((message) => message.actor === "worker")) {
-          messages.push({ role: "assistant", actor: "worker", label: "Worker ส่งผลงานกลับมาให้ Supervisor", text: `${saved.worker.summary}\nผลงาน: ${saved.worker.artifact.filename}` });
-        }
-        setProject({ ...blankProject(), ...saved, pendingFeedback: saved.pendingFeedback || "", messages, activities });
-        setRequest(saved.request || "");
-      }
-    } catch (error) { console.warn("Could not restore saved workspace", error); }
-    setReady(true);
+    if (!supabase) return;
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      setIsAuthenticated(Boolean(session?.user));
+      if (event === "SIGNED_OUT") setAuthUserId(null);
+      if (!session?.user) setCloudStatus("signedout");
+    });
+    return () => data.subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
-    if (ready) localStorage.setItem(KEY, JSON.stringify(project));
-  }, [project, ready]);
+    setReady(true);
+    void initializeSupabase();
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    if (!authUserId) return;
+    localStorage.setItem(accountStorageKey(KEY, authUserId), JSON.stringify(project));
+    if (activeConversationId) localStorage.setItem(accountStorageKey(ACTIVE_CONVERSATION_KEY, authUserId), activeConversationId);
+    if (!activeConversationId || !project.request) return;
+    const timeout = window.setTimeout(() => { void saveConversation(activeConversationId, project); }, 800);
+    return () => window.clearTimeout(timeout);
+  }, [project, ready, activeConversationId, cloudStatus, authUserId]);
+
+  async function initializeSupabase() {
+    if (!supabase || !isSupabaseConfigured) { setIsAuthenticated(false); setCloudStatus("local"); return; }
+    setCloudStatus("connecting");
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!sessionData.session?.user) { setIsAuthenticated(false); setAuthUserId(null); setCloudStatus("signedout"); return; }
+      setIsAuthenticated(true);
+      const userId = sessionData.session.user.id;
+      setAuthUserId(userId);
+      const conversationsKey = accountStorageKey(CONVERSATIONS_KEY, userId);
+      const localSessions = JSON.parse(localStorage.getItem(conversationsKey) || "[]") as SavedConversation[];
+      const selectedId = localStorage.getItem(accountStorageKey(ACTIVE_CONVERSATION_KEY, userId));
+      const savedProject = localStorage.getItem(accountStorageKey(KEY, userId));
+      if (savedProject) {
+        const parsed = JSON.parse(savedProject) as Project;
+        setProject(parsed);
+        setRequest(parsed.request || "");
+      } else {
+        setProject(blankProject());
+        setRequest("");
+      }
+      setActiveConversationId(selectedId);
+      setConversations(localSessions);
+      const { data, error } = await supabase.from("concierge_conversations").select("id,title,state,updated_at").eq("user_id", userId).order("updated_at", { ascending: false });
+      if (error) throw error;
+      const remoteSessions = (data || []).map((row) => ({ id: row.id as string, title: row.title as string, state: row.state as Project, updatedAt: row.updated_at as string }));
+      const remoteIds = new Set(remoteSessions.map((conversation) => conversation.id));
+      const missingLocally = localSessions.filter((conversation) => !remoteIds.has(conversation.id) && conversation.state.request);
+      for (const conversation of missingLocally) {
+        const { error: saveError } = await supabase.from("concierge_conversations").upsert({ id: conversation.id, user_id: userId, title: conversation.title, state: conversation.state, updated_at: conversation.updatedAt });
+        if (saveError) throw saveError;
+      }
+      const allSessions = [...remoteSessions, ...missingLocally].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      setConversations(allSessions);
+      localStorage.setItem(conversationsKey, JSON.stringify(allSessions));
+      setCloudStatus("connected");
+      const selected = allSessions.find((conversation) => conversation.id === selectedId);
+      if (selected) { setProject(selected.state); setRequest(selected.state.request); }
+      else if (!savedProject && allSessions.length) { setActiveConversationId(allSessions[0].id); setProject(allSessions[0].state); setRequest(allSessions[0].state.request); }
+    } catch (error) {
+      console.warn("Supabase Workspace unavailable; keeping local history:", error);
+      setCloudStatus("error");
+    }
+  }
+
+  async function saveConversation(id: string, state: Project) {
+    if (!state.request) return;
+    if (!supabase) return;
+    let userId: string;
+    try { userId = await ensureSupabaseUserId(); }
+    catch { return; }
+    const updated: SavedConversation = { id, title: conversationTitle(state), state, updatedAt: new Date().toISOString() };
+    const conversationsKey = accountStorageKey(CONVERSATIONS_KEY, userId);
+    const current = JSON.parse(localStorage.getItem(conversationsKey) || "[]") as SavedConversation[];
+    const localSessions = [updated, ...current.filter((conversation) => conversation.id !== id)].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 100);
+    localStorage.setItem(conversationsKey, JSON.stringify(localSessions));
+    setConversations(localSessions);
+    if (cloudStatus !== "connected") return;
+    try {
+      const { error } = await supabase.from("concierge_conversations").upsert({ id, user_id: userId, title: updated.title, state, updated_at: updated.updatedAt });
+      if (error) throw error;
+      setCloudStatus("connected");
+    } catch (error) {
+      console.warn("Could not sync conversation to Supabase:", error);
+      setCloudStatus("error");
+    }
+  }
 
   function notify(message: string) {
     setToast(message);
     window.setTimeout(() => setToast(""), 4500);
+  }
+
+  async function refreshSupabaseWorkspace() {
+    await initializeSupabase();
+  }
+
+  async function signInWithEmail(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!supabase) return notify("ใส่ Supabase URL และ Publishable Key ใน .env ก่อน");
+    setAuthBusy(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword });
+      if (error) notify(`เข้าสู่ระบบไม่สำเร็จ: ${error.message}`);
+      else await refreshSupabaseWorkspace();
+    } catch (error) { notify(error instanceof Error ? error.message : "เข้าสู่ระบบไม่สำเร็จ"); }
+    finally { setAuthBusy(false); }
+  }
+
+  async function signUpWithEmail() {
+    if (!supabase) return notify("ใส่ Supabase URL และ Publishable Key ใน .env ก่อน");
+    if (!authEmail.trim() || authPassword.length < 6) return notify("กรอกอีเมลและรหัสผ่านอย่างน้อย 6 ตัวอักษร");
+    setAuthBusy(true);
+    try {
+      const { data, error } = await supabase.auth.signUp({ email: authEmail.trim(), password: authPassword, options: { emailRedirectTo: window.location.origin } });
+      if (error) notify(`สมัครบัญชีไม่สำเร็จ: ${error.message}`);
+      else if (data.session) await refreshSupabaseWorkspace();
+      else notify("สมัครบัญชีแล้ว กรุณาตรวจอีเมลและกดยืนยัน ก่อนกลับมาเข้าสู่ระบบ");
+    } catch (error) { notify(error instanceof Error ? error.message : "สมัครบัญชีไม่สำเร็จ"); }
+    finally { setAuthBusy(false); }
+  }
+
+  async function signOut() {
+    if (!supabase) return;
+    const { error } = await supabase.auth.signOut();
+    if (error) notify(`ออกจากระบบไม่สำเร็จ: ${error.message}`);
+    else { setIsAuthenticated(false); setAuthUserId(null); setCloudStatus("signedout"); }
   }
 
   function activity(title: string, detail: string) {
@@ -105,8 +226,11 @@ export default function Home() {
   }
 
   async function callAgent(role: "supervisor" | "worker" | "web" | "qa", input: string, options: { answer?: string; plan?: Step[]; draft?: string; feedback?: string; history?: Message[] } = {}) {
+    if (!supabase) throw new Error("ยังไม่ได้ตั้งค่า Supabase");
+    const { data: authData, error: authError } = await supabase.auth.getSession();
+    if (authError || !authData.session) throw new Error("เซสชันหมดอายุ กรุณาเข้าสู่ระบบอีกครั้ง");
     const payload = role === "supervisor" && options.history ? { ...options, history: options.history.slice(-40) } : options;
-    const response = await fetch("/api/agent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ role, input, ...payload }) });
+    const response = await fetch("/api/agent", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${authData.session.access_token}` }, body: JSON.stringify({ role, input, ...payload }) });
     const body = await response.json() as { result?: unknown; error?: string };
     if (!response.ok) throw new Error(body.error || `เกิดข้อผิดพลาด (${response.status})`);
     return body.result;
@@ -128,6 +252,8 @@ export default function Home() {
     event.preventDefault();
     const goal = request.trim();
     if (!goal || busy) return;
+    const conversationId = activeConversationId || crypto.randomUUID();
+    setActiveConversationId(conversationId);
     const initialTurn: Message = { role: "user", label: "เป้าหมาย", text: goal };
     setProject((current) => ({ ...blankProject(), request: goal, messages: [initialTurn] }));
     setTab("chat");
@@ -307,18 +433,57 @@ export default function Home() {
 
   function reset() {
     if ((project.request || project.worker) && !window.confirm("เริ่มโปรเจกต์ใหม่หรือไม่?")) return;
+    if (activeConversationId && project.request) void saveConversation(activeConversationId, project);
+    setActiveConversationId(null);
     setProject(blankProject()); setRequest(""); setChatInput(""); setAnswer(""); setFeedback(""); setRefineOpen(false); setTab("chat");
+  }
+
+  function showWorkspace() {
+    if (activeConversationId && project.request) void saveConversation(activeConversationId, project);
+    setTab("workspace");
+  }
+
+  function openConversation(conversation: SavedConversation) {
+    setActiveConversationId(conversation.id);
+    setProject(conversation.state);
+    setRequest(""); setChatInput(""); setAnswer(""); setFeedback(""); setRefineOpen(false);
+    setTab("chat");
+  }
+
+  function startConversation() {
+    if (activeConversationId && project.request) void saveConversation(activeConversationId, project);
+    setActiveConversationId(null);
+    setProject(blankProject()); setRequest(""); setChatInput(""); setAnswer(""); setFeedback(""); setRefineOpen(false);
+    setTab("chat");
   }
 
   const latestFeedback = [...project.messages].reverse().find((message) => message.label === "Feedback ถึง Supervisor");
   const interviewMessages = project.messages.filter((message) => message.label === "คำถามจาก Supervisor" || message.label === "คำตอบของคุณ");
   const interviewHistory = project.supervisor?.status === "needs_clarification" ? interviewMessages.slice(0, -1) : interviewMessages;
   const launched = Boolean(project.request);
+  const inWorkspace = launched || tab === "workspace";
 
-  return <main className={`shell ${launched ? "" : "landing-shell"}`}>
-    {launched && <aside className="sidebar">
+  if (!isAuthenticated) return <main className="auth-gate"><section className="auth-gate-card">
+    <div className="landing-brand"><span className="brand-mark">p</span><span>promptbridge <i>AI CONCIERGE</i></span></div>
+    <div className="landing-eyebrow"><span>✳</span> SECURE WORKSPACE</div>
+    <h1>เข้าสู่ระบบก่อนใช้งาน</h1>
+    <p className="auth-gate-copy">ใช้บัญชีอีเมลของคุณเพื่อเข้าสู่ AI Concierge และเปิดบทสนทนาที่บันทึกไว้</p>
+    {toast && <div className="workspace-notice warning">{toast}</div>}
+    {!isSupabaseConfigured ? <div className="workspace-notice warning">ยังไม่ได้ตั้งค่า Supabase กรุณาเพิ่ม Supabase URL และ Publishable Key ในไฟล์ .env แล้วเริ่มระบบใหม่</div> : cloudStatus === "connecting" ? <div className="workspace-notice">กำลังตรวจสอบสถานะการเข้าสู่ระบบ…</div> : <>
+      {cloudStatus === "error" && <div className="workspace-notice warning">เชื่อมต่อ Supabase ไม่สำเร็จ กรุณาตรวจ URL, Key และการเชื่อมต่อ แล้วลองใหม่</div>}
+      <form className="email-auth-form auth-gate-form" onSubmit={signInWithEmail}>
+        <label htmlFor="gate-email">อีเมล</label><input id="gate-email" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" required />
+        <label htmlFor="gate-password">รหัสผ่าน</label><input id="gate-password" type="password" autoComplete="current-password" minLength={6} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="อย่างน้อย 6 ตัวอักษร" required />
+        <div className="email-auth-actions"><button className="primary-button" disabled={authBusy}>{authBusy ? "กำลังดำเนินการ…" : "เข้าสู่ระบบ"}</button><button type="button" className="secondary-button" disabled={authBusy} onClick={() => void signUpWithEmail()}>สมัครบัญชีใหม่</button></div>
+      </form>
+      <small className="auth-gate-hint">การสมัครอาจต้องยืนยันอีเมลก่อนเข้าสู่ระบบ</small>
+    </>}
+  </section></main>;
+
+  return <main className={`shell ${inWorkspace ? "" : "landing-shell"}`}>
+    {inWorkspace && <aside className="sidebar">
       <div className="brand"><span className="brand-mark">p</span><span><strong>promptbridge</strong><small>AI concierge workspace</small></span></div>
-      <div className="side-label">WORKSPACE</div><button className="workspace-link" onClick={reset}><span className="workspace-icon">▦</span> โปรเจกต์ของฉัน <span className="side-dot" /></button>
+      <div className="side-label">WORKSPACE</div><button className={`workspace-link ${tab === "workspace" ? "selected" : ""}`} onClick={showWorkspace}><span className="workspace-icon">▦</span> โปรเจกต์ของฉัน <span className="side-dot" /></button>
       <div className="side-label workflow-label">WORKFLOW</div>
       <button className={`side-tab ${tab === "chat" ? "selected" : ""}`} onClick={() => setTab("chat")}><span className="side-num">00</span><span>คุยกับ Supervisor</span><small>{busy ? "กำลังทำงาน" : project.worker ? "รายงานผลแล้ว" : "Supervisor รับคำขอ"}</small></button>
       <button className={`side-tab ${tab === "supervisor" ? "selected" : ""}`} onClick={() => setTab("supervisor")}><span className="side-num">01</span><span>Supervisor</span><small>{project.supervisor?.status === "ready" ? "แผนพร้อม" : project.supervisor ? "ถามเพิ่ม" : "เริ่มต้น"}</small></button>
@@ -328,19 +493,19 @@ export default function Home() {
       <div className="profile"><span className="avatar">Y</span><span><strong>ผู้ใช้งาน</strong><small>Personal workspace</small></span><span className="profile-menu">•••</span></div>
     </aside>}
 
-    <section className={`main-area ${launched ? "" : "landing-main"}`}>
-      {launched && <header className="topbar"><div className="breadcrumb">Workspace <span>/</span> <strong>{tab === "chat" ? "บทสนทนา" : tab === "supervisor" ? "Supervisor" : "Worker & Preview"}</strong></div><div className="top-actions"><span className="model-chip"><i /> Gemini Flash</span><span className="local-chip">◉ บันทึกในเครื่อง</span><button className="icon-button" title="เริ่มใหม่" onClick={reset}>↻</button><button className="mobile-reset" onClick={reset}>เริ่มใหม่</button></div></header>}
-      <div className={`content ${launched ? "" : "landing-content"}`}>
-      {launched ? <>
-        <div className="page-heading"><div><div className="eyebrow"><span>✳</span> {tab === "chat" ? "SUPERVISOR DESK" : tab === "supervisor" ? "SUPERVISOR CONTROL" : "REVIEW & CO-CREATE"}</div><h1>{tab === "chat" ? "คุยกับ Supervisor แล้วรับผลงานได้เลย" : tab === "supervisor" ? "ตรวจเป้าหมายและแผนของ Supervisor" : "ตรวจผลงานและทำงานร่วมกับ Worker"}</h1><p>{tab === "chat" ? "ทุกคำขอและ Feedback ส่งถึง Supervisor ก่อน เขาจดจำบทสนทนา แล้วค่อยสั่ง Worker และรายงานผลให้คุณ" : tab === "supervisor" ? "ดูสิ่งที่ Supervisor เข้าใจและคำสั่งที่จะแบ่งให้ Worker" : "ดูตัวอย่างผลงาน ส่ง Feedback ให้ Supervisor ปรับคำสั่งก่อนมอบหมาย Worker แล้วดาวน์โหลดหรืออนุมัติ"}</p></div><div className="step-indicator">{tab === "chat" ? "SUPERVISOR" : tab === "supervisor" ? "01 / 02" : "02 / 02"}</div></div>
+    <section className={`main-area ${inWorkspace ? "" : "landing-main"}`}>
+      {inWorkspace && <header className="topbar"><div className="breadcrumb">Workspace <span>/</span> <strong>{tab === "workspace" ? "โปรเจกต์ของฉัน" : tab === "chat" ? "บทสนทนา" : tab === "supervisor" ? "Supervisor" : "Worker & Preview"}</strong></div><div className="top-actions"><span className="model-chip"><i /> Gemini Flash</span><span className="local-chip">◉ {cloudStatus === "connected" ? "บันทึกบน Supabase" : cloudStatus === "connecting" ? "กำลังเชื่อมต่อ" : cloudStatus === "error" ? "บันทึกในเครื่อง · Cloud ขัดข้อง" : "บันทึกในเครื่อง"}</span><button className="signout-button" onClick={() => void signOut()}>ออกจากระบบ</button><button className="icon-button" title="เริ่มใหม่" onClick={reset}>↻</button><button className="mobile-reset" onClick={reset}>เริ่มใหม่</button></div></header>}
+      <div className={`content ${inWorkspace ? "" : "landing-content"}`}>
+      {inWorkspace ? <>
+        {tab !== "workspace" && <div className="page-heading"><div><div className="eyebrow"><span>✳</span> {tab === "chat" ? "SUPERVISOR DESK" : tab === "supervisor" ? "SUPERVISOR CONTROL" : "REVIEW & CO-CREATE"}</div><h1>{tab === "chat" ? "คุยกับ Supervisor แล้วรับผลงานได้เลย" : tab === "supervisor" ? "ตรวจเป้าหมายและแผนของ Supervisor" : "ตรวจผลงานและทำงานร่วมกับ Worker"}</h1><p>{tab === "chat" ? "ทุกคำขอและ Feedback ส่งถึง Supervisor ก่อน เขาจดจำบทสนทนา แล้วค่อยสั่ง Worker และรายงานผลให้คุณ" : tab === "supervisor" ? "ดูสิ่งที่ Supervisor เข้าใจและคำสั่งที่จะแบ่งให้ Worker" : "ดูตัวอย่างผลงาน ส่ง Feedback ให้ Supervisor ปรับคำสั่งก่อนมอบหมาย Worker แล้วดาวน์โหลดหรืออนุมัติ"}</p></div><div className="step-indicator">{tab === "chat" ? "SUPERVISOR" : tab === "supervisor" ? "01 / 02" : "02 / 02"}</div></div>}
 
-        <nav className="tabs" aria-label="ขั้นตอน AI Concierge">
+        {tab !== "workspace" && <nav className="tabs" aria-label="ขั้นตอน AI Concierge">
           <button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}><span className="tab-number">✳</span><span><strong>คุยกับ Supervisor</strong><small>ส่งคำขอและ Feedback</small></span><span className="tab-status">{busy ? "กำลังทำงาน" : project.worker ? "รายงานผลแล้ว" : "พร้อมคุย"}</span></button>
           <button className={tab === "supervisor" ? "active" : ""} onClick={() => setTab("supervisor")}><span className="tab-number">01</span><span><strong>Supervisor</strong><small>ดูเป้าหมายและแผน</small></span><span className="tab-status">{project.supervisor?.status === "ready" ? "แผนพร้อม" : project.supervisor ? "รอคำตอบ" : "เริ่มต้น"}</span></button>
           <button className={tab === "worker" ? "active" : ""} onClick={() => setTab("worker")}><span className="tab-number">02</span><span><strong>ผลงาน</strong><small>Preview และไฟล์</small></span><span className="tab-status">{project.worker?.finalized ? "อนุมัติแล้ว" : project.worker ? "Draft พร้อม" : "รอแผน"}</span></button>
-        </nav>
+        </nav>}
 
-        {tab !== "chat" && <section className="capability-strip" aria-label="องค์ประกอบ AI Concierge ทั้ง 6 ด้าน">
+        {tab !== "chat" && tab !== "workspace" && <section className="capability-strip" aria-label="องค์ประกอบ AI Concierge ทั้ง 6 ด้าน">
           {[
             ["01", "Remember", "บันทึกเป้าหมายและ Feedback ในเครื่อง"],
             ["02", "Understand", "Supervisor สรุปและถามเมื่อข้อมูลยังไม่พอ"],
@@ -351,15 +516,18 @@ export default function Home() {
           ].map(([number, name, description]) => <div className="capability" title={description} key={name}><span>{number}</span><strong>{name}</strong><i>✓</i></div>)}
         </section>}
 
-        {tab !== "chat" && <ProcessStepper busy={busy} supervisor={project.supervisor} approvedPlan={project.approvedPlan} worker={project.worker} />}
+        {tab !== "chat" && tab !== "workspace" && <ProcessStepper busy={busy} supervisor={project.supervisor} approvedPlan={project.approvedPlan} worker={project.worker} />}
 
-        {tab === "chat" ? <section className="panel chat-workspace">
+        {tab === "workspace" && cloudStatus === "signedout" && <div className="email-auth-card"><h3>เข้าสู่ระบบเพื่อซิงก์บทสนทนา</h3><p>ใช้บัญชีอีเมลและรหัสผ่านเพื่อเปิดประวัติจาก Supabase</p><form className="email-auth-form" onSubmit={signInWithEmail}><label htmlFor="auth-email">อีเมล</label><input id="auth-email" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" required /><label htmlFor="auth-password">รหัสผ่าน</label><input id="auth-password" type="password" autoComplete="current-password" minLength={6} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="อย่างน้อย 6 ตัวอักษร" required /><div className="email-auth-actions"><button className="primary-button" disabled={authBusy}>{authBusy ? "กำลังดำเนินการ…" : "เข้าสู่ระบบ"}</button><button type="button" className="secondary-button" disabled={authBusy} onClick={() => void signUpWithEmail()}>สมัครบัญชีใหม่</button></div></form><small>ถ้าสมัครแล้ว ระบบอาจส่งลิงก์ยืนยันไปยังอีเมลก่อนเข้าสู่ระบบได้</small></div>}
+        {tab === "workspace" && cloudStatus === "local" && <div className="workspace-notice">เพิ่มค่า Supabase ใน .env เพื่อเปิดการซิงก์บน Cloud</div>}
+        {tab === "workspace" && cloudStatus === "error" && <div className="workspace-notice warning">ซิงก์ Supabase ไม่สำเร็จ ข้อมูลในเครื่องยังใช้งานได้ <button className="secondary-button" onClick={() => void refreshSupabaseWorkspace()}>ลองเชื่อมต่อใหม่</button></div>}
+        {tab === "workspace" ? <section className="workspace-page"><div className="workspace-page-heading"><div><span className="workspace-icon">▦</span><div><h2>บทสนทนาที่บันทึกไว้</h2><p>เปิดงานเดิมเพื่อย้อนกลับไปอ่านและคุยต่อกับ Supervisor</p></div></div><button className="primary-button" onClick={startConversation}>＋ เริ่มบทสนทนาใหม่</button></div>{cloudStatus === "connecting" && <div className="workspace-notice">กำลังโหลดรายการจาก Supabase…</div>}{cloudStatus === "error" && <div className="workspace-notice warning">Supabase ยังเชื่อมต่อไม่ได้ รายการที่บันทึกในเครื่องยังเปิดได้</div>}{conversations.length ? <div className="conversation-list">{conversations.map((conversation) => <button className={`conversation-item ${conversation.id === activeConversationId ? "current" : ""}`} key={conversation.id} onClick={() => openConversation(conversation)}><span className="conversation-icon">▤</span><span className="conversation-item-main"><strong>{conversation.title}</strong><small>{conversation.state.messages.filter((message) => message.role === "user").length} ข้อความจากคุณ · {conversation.state.worker?.artifact.filename || (conversation.state.supervisor?.status === "needs_clarification" ? "รอคำตอบ Supervisor" : "ยังไม่มีผลงาน")}</small></span><span className="conversation-date">{new Date(conversation.updatedAt).toLocaleString("th-TH", { dateStyle: "medium", timeStyle: "short" })}</span><span className="conversation-open">เปิด →</span></button>)}</div> : <div className="workspace-empty"><span>▤</span><strong>ยังไม่มีบทสนทนาที่บันทึก</strong><p>เริ่มคุยกับ Supervisor แล้วบทสนทนาจะปรากฏที่นี่</p><button className="secondary-button" onClick={startConversation}>เริ่มบทสนทนาแรก</button></div>}</section> : tab === "chat" ? <section className="panel chat-workspace">
       <div className="chat-heading"><span className="brand-mark">S</span><div><strong>Supervisor</strong><small>คุณกำลังคุยกับ Supervisor · จดจำบริบทของบทสนทนานี้ไว้</small></div></div>
           <div className="chat-messages">
             {project.messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.label}`}><span className="chat-avatar">{message.role === "assistant" ? message.actor === "worker" ? "W" : "S" : "คุณ"}</span><div className="chat-bubble"><small>{message.role === "assistant" ? message.actor === "worker" ? `Worker · ${message.label}` : `Supervisor · ${message.label}` : "คุณ · ส่งถึง Supervisor"}</small><p>{message.text}</p></div></div>)}
             {busy && <div className="chat-message assistant"><span className="chat-avatar">S</span><div className="chat-bubble"><ProgressPanel busy={busy} /></div></div>}
             {project.supervisor?.status === "ready" && !project.approvedPlan && !project.worker && <div className="chat-plan-card"><strong>คำสั่งจาก Supervisor ไปยัง Worker</strong><p>{project.supervisor.summary}</p><ol>{project.supervisor.plan.map((step, index) => <li key={`${index}-${step.title}`}><b>{index + 1}.</b> <span><strong>{step.title}</strong> — {step.description}</span></li>)}</ol><button className="primary-button" onClick={approvePlan} disabled={Boolean(busy)}>{busy ? <><span className="spinner light" /> กำลังทำงาน</> : <>✓ ยืนยัน แล้วให้ Worker ลงมือ</>}</button><button className="chat-link-button" onClick={() => setTab("supervisor")} disabled={Boolean(busy)}>ตรวจรายละเอียด Supervisor</button></div>}
-            {project.worker && <div className="chat-artifact-card"><div className="chat-artifact-heading"><span>{project.worker.artifact.kind === "web" ? "WEB" : project.worker.artifact.filename.split(".").pop()?.toUpperCase()}</span><div><strong>{project.worker.artifact.filename}</strong><small>{project.worker.summary}</small></div></div><div className="chat-artifact-actions">{project.worker.artifact.kind === "web" && <button className="secondary-button" onClick={() => setTab("worker")}>เปิด Preview</button>}<button className="secondary-button" onClick={() => downloadArtifact(project.worker!.artifact)}>↓ ดาวน์โหลดไฟล์</button>{!project.worker.finalized && <button className="approve-button" onClick={approveDraft} disabled={Boolean(busy)}>✓ อนุมัติผลงาน</button>}</div>{project.worker.quality && <small className="chat-quality">{project.worker.quality.status === "approved" ? "Supervisor ตรวจผ่านเบื้องต้น" : project.worker.quality.summary}</small>}</div>}
+            {project.worker && <div className="chat-artifact-card"><div className="chat-artifact-heading"><span>{project.worker.artifact.kind === "web" ? "WEB" : project.worker.artifact.filename.split(".").pop()?.toUpperCase()}</span><div><strong>{project.worker.artifact.filename}</strong><small>{project.worker.summary}</small></div></div>{project.worker.artifact.kind === "file" && <pre className="chat-artifact-content">{project.worker.artifact.content}</pre>}<div className="chat-artifact-actions">{project.worker.artifact.kind === "web" && <><button className="secondary-button" onClick={() => { setWebArtifactView("preview"); setTab("worker"); }}>เปิด Preview</button><button className="secondary-button" onClick={() => { setWebArtifactView("code"); setTab("worker"); }}>ดูโค้ด</button></>}<button className="secondary-button" onClick={() => downloadArtifact(project.worker!.artifact)}>↓ ดาวน์โหลดไฟล์</button>{!project.worker.finalized && <button className="approve-button" onClick={approveDraft} disabled={Boolean(busy)}>✓ อนุมัติผลงาน</button>}</div>{project.worker.quality && <small className="chat-quality">{project.worker.quality.status === "approved" ? "Supervisor ตรวจผ่านเบื้องต้น" : project.worker.quality.summary}</small>}</div>}
           </div>
           <form className="chat-composer" onSubmit={submitChat}><textarea value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder={project.supervisor?.status === "needs_clarification" ? "ตอบคำถามของ Supervisor..." : project.worker ? "คุยกับ Supervisor หรือขอแก้ผลงาน..." : "บอก Supervisor ว่าต้องการอะไร..."} rows={2} disabled={Boolean(busy)} /><div><small>{project.supervisor?.status === "needs_clarification" ? "ตอบตามที่ทราบได้ หรือขอให้แนะนำ — Supervisor จะจำคำตอบนี้ไว้" : project.worker ? "ข้อความนี้ส่งถึง Supervisor ก่อน เขาจะปรับแผนแล้วค่อยมอบหมาย Worker" : "คุณกำลังคุยกับ Supervisor — เขาจะถามเพิ่มถ้าต้องการรายละเอียด"}</small><button className="primary-button" disabled={Boolean(busy) || !chatInput.trim()}>{busy ? <><span className="spinner light" /> กำลังทำงาน</> : <>ส่งให้ Supervisor ↗</>}</button></div></form>
         </section> : tab === "supervisor" ? <div className="supervisor-grid">
@@ -385,9 +553,9 @@ export default function Home() {
         </div> : <div className="worker-grid">
           <section className="panel preview-panel"><div className="panel-heading"><span className="panel-icon blue">▣</span><div><h2>{project.worker?.artifact.kind === "web" ? "ตัวอย่างเว็บไซต์" : "ตัวอย่างผลงาน"}</h2><p>{project.worker?.artifact.filename || "เว็บไซต์ ตาราง หรือไฟล์ที่ Worker สร้างจะแสดงตรงนี้"}</p></div><span className={`status-pill ${busy ? "working" : project.worker ? "ready" : "idle"}`}>{busy ? <><span className="spinner" /> {busy === "supervisor" ? "กำลังวางแผน" : busy === "worker" ? "กำลังสร้าง" : "QA ตรวจทาน"}</> : project.worker?.finalized ? "อนุมัติแล้ว" : project.worker ? "Draft" : "รอแผน"}</span></div>
             <div className="preview-wrap">
-              {project.worker ? project.worker.artifact.kind === "web" ? <iframe title="ตัวอย่างเว็บที่ Worker สร้าง" sandbox="" srcDoc={project.worker.artifact.content} /> : <div className="artifact-preview">
+              {project.worker ? project.worker.artifact.kind === "web" ? <div className="web-artifact-view"><div className="web-view-switch" role="tablist" aria-label="มุมมองผลงานเว็บไซต์"><button className={webArtifactView === "preview" ? "active" : ""} onClick={() => setWebArtifactView("preview")}>Preview</button><button className={webArtifactView === "code" ? "active" : ""} onClick={() => setWebArtifactView("code")}>โค้ด HTML</button></div>{webArtifactView === "preview" ? <iframe title="ตัวอย่างเว็บที่ Worker สร้าง" sandbox="" srcDoc={project.worker.artifact.content} /> : <pre className="web-source-code">{project.worker.artifact.content}</pre>}<button className="primary-button" onClick={() => downloadArtifact(project.worker!.artifact)}>↓ ดาวน์โหลดไฟล์ HTML</button></div> : <div className="artifact-preview">
                 <div className="artifact-meta"><span>{project.worker.artifact.mimeType === "text/csv" ? "CSV" : project.worker.artifact.mimeType.split("/").pop()?.toUpperCase()}</span><strong>{project.worker.artifact.filename}</strong><small>{project.worker.artifact.mimeType}</small></div>
-                {project.worker.artifact.mimeType === "text/csv" ? <div className="csv-preview"><table><tbody>{parseCsvPreview(project.worker.artifact.content).map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => rowIndex === 0 ? <th key={cellIndex}>{cell}</th> : <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div> : <pre>{project.worker.artifact.content.slice(0, 8_000)}{project.worker.artifact.content.length > 8_000 ? "\n… แสดงตัวอย่างบางส่วน" : ""}</pre>}
+                {project.worker.artifact.mimeType === "text/csv" ? <div className="csv-preview"><table><tbody>{parseCsvPreview(project.worker.artifact.content).map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => rowIndex === 0 ? <th key={cellIndex}>{cell}</th> : <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div> : <pre>{project.worker.artifact.content}</pre>}
                 <button className="primary-button" onClick={() => downloadArtifact(project.worker!.artifact)}>↓ ดาวน์โหลด {project.worker.artifact.filename}</button>
               </div> : <div className="preview-empty"><span>▣</span><strong>ตัวอย่างผลงานจะแสดงที่นี่</strong><p>อนุมัติแผนในแท็บ Supervisor ก่อน Worker จะสร้างเว็บไซต์ ตาราง หรือไฟล์ตามคำสั่ง</p><button className="secondary-button" onClick={() => setTab("supervisor")}>กลับไปที่ Supervisor ←</button></div>}
             </div>
@@ -416,6 +584,8 @@ export default function Home() {
         <p className="landing-subtitle">พิมพ์สิ่งที่ต้องการเหมือนคุยกับ chatbot<br className="desktop-break" /> Supervisor จะถามเพิ่ม แล้วส่งคำตอบหรือไฟล์กลับมาให้</p>
         <form className="landing-form" onSubmit={submitGoal}><textarea autoFocus value={request} onChange={(event) => setRequest(event.target.value)} placeholder="เช่น อยากได้สรุปข้อมูลการลงทุน..." rows={4} required /><div className="landing-form-footer"><span>✧ ไม่ต้องเขียน Prompt ให้สมบูรณ์ — Supervisor จะถามเพิ่มถ้าจำเป็น</span><button className="primary-button" disabled={!request.trim() || Boolean(busy)}>{busy === "supervisor" ? <><span className="spinner light" /> กำลังวิเคราะห์</> : <>เริ่มจัดการงาน <span>→</span></>}</button></div></form>
         <div className="landing-examples"><span>ลองเริ่มจาก</span>{["สรุปข้อมูลการลงทุน", "วางแผนทริป 3 วัน", "ทำเว็บแนะนำคาเฟ่"].map((example) => <button key={example} onClick={() => setRequest(example)}>{example} <span>↗</span></button>)}</div>
+        {isSupabaseConfigured && <button className="landing-history-button" onClick={() => setTab("workspace")}>เข้าสู่ระบบด้วยอีเมลเพื่อซิงก์บทสนทนา</button>}
+        {conversations.length > 0 && <button className="landing-history-button" onClick={showWorkspace}>▤ กลับไปเปิดบทสนทนาเดิม ({conversations.length})</button>}
         {busy === "supervisor" && <ProgressPanel busy="supervisor" />}
         <div className="landing-trust"><span>◈</span> คุณเป็นผู้สั่งการ — ระบบจะขออนุมัติก่อนเริ่มทำและก่อนส่งมอบ</div>
       </section>}

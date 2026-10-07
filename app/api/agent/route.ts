@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -64,7 +65,55 @@ function validateResult(value: unknown, role: Payload["role"]): boolean {
   return supportedFileTypes.has(mimeType) && !filename.toLowerCase().endsWith(".html");
 }
 
+function extractWorkerContent(raw: string) {
+  const contentField = /"content"\s*:\s*"/i.exec(raw);
+  if (!contentField) return raw.trim();
+  const contentStart = contentField.index + contentField[0].length;
+  const notesStart = raw.lastIndexOf('"notes"');
+  const contentEnd = raw.lastIndexOf('"', notesStart > contentStart ? notesStart - 1 : raw.length - 1);
+  if (contentEnd < contentStart) return raw.trim();
+
+  const encoded = raw.slice(contentStart, contentEnd);
+  let decoded = "";
+  for (let index = 0; index < encoded.length; index += 1) {
+    const char = encoded[index];
+    if (char !== "\\" || index + 1 >= encoded.length) { decoded += char; continue; }
+    const next = encoded[++index];
+    const escapes: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+    if (next === "u" && /^[\da-f]{4}$/i.test(encoded.slice(index + 1, index + 5))) {
+      decoded += String.fromCharCode(parseInt(encoded.slice(index + 1, index + 5), 16));
+      index += 4;
+    } else decoded += escapes[next] ?? next;
+  }
+  return decoded.trim() || raw.trim();
+}
+
+function workerTextFallback(raw: string, parsed?: unknown) {
+  const parsedArtifact = isRecord(parsed) && isRecord(parsed.artifact) ? parsed.artifact : null;
+  const content = (parsedArtifact && typeof parsedArtifact.content === "string" ? parsedArtifact.content : extractWorkerContent(raw)).slice(0, 700_000);
+  const title = isRecord(parsed) && typeof parsed.title === "string" ? parsed.title : "คำตอบจาก Worker";
+  const summary = isRecord(parsed) && typeof parsed.summary === "string"
+    ? parsed.summary
+    : "Gemini ตอบกลับมาไม่ตรงรูปแบบ จึงบันทึกเนื้อหาที่ได้เป็นไฟล์ข้อความให้ดาวน์โหลด";
+  return {
+    title,
+    summary,
+    needsWebPreview: false,
+    artifact: { kind: "file", filename: "worker-response.txt", mimeType: "text/plain", content },
+    notes: ["คำตอบถูกเก็บเป็นไฟล์ข้อความสำรอง เนื่องจากรูปแบบ JSON จาก Gemini ไม่สมบูรณ์"],
+  };
+}
+
 export async function POST(request: Request) {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const bearerToken = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!supabaseUrl || !supabaseKey) return NextResponse.json({ error: "ยังไม่ได้ตั้งค่า Supabase สำหรับตรวจสอบบัญชี" }, { status: 503 });
+  if (!bearerToken) return NextResponse.json({ error: "กรุณาเข้าสู่ระบบก่อนใช้งาน" }, { status: 401 });
+  const authClient = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false } });
+  const { data: authData, error: authError } = await authClient.auth.getUser(bearerToken);
+  if (authError || !authData.user) return NextResponse.json({ error: "เซสชันไม่ถูกต้อง กรุณาเข้าสู่ระบบอีกครั้ง" }, { status: 401 });
+
   const payload: unknown = await request.json().catch(() => null);
   if (!validPayload(payload)) return NextResponse.json({ error: "ข้อมูลคำขอไม่ถูกต้อง" }, { status: 400 });
   const apiKey = process.env.GEMINI_API_KEY;
@@ -104,10 +153,18 @@ export async function POST(request: Request) {
     try { result = JSON.parse(text); } catch {
       console.error("Gemini returned invalid JSON:", JSON.stringify({ role: payload.role, model, finishReason, responseLength: text.length, responseEnd: text.slice(-1_000) }));
       if (finishReason === "MAX_TOKENS") return NextResponse.json({ error: payload.role === "web" ? "สร้างหน้าเว็บไม่ครบตามเพดาน output" : "สร้างคำตอบไม่ครบตามเพดาน output" }, { status: 502 });
+      if (payload.role === "worker" && text.trim()) {
+        result = workerTextFallback(text);
+        return NextResponse.json({ result }, { headers: { "Cache-Control": "no-store" } });
+      }
       return NextResponse.json({ error: "Gemini ส่งผลลัพธ์ที่อ่านไม่ได้ กรุณาลองอีกครั้ง" }, { status: 502 });
     }
     if (!validateResult(result, payload.role)) {
       console.error("Gemini result failed validation:", JSON.stringify({ role: payload.role, model, result }).slice(0, 8_000));
+      if (payload.role === "worker" && isRecord(result)) {
+        const fallback = workerTextFallback(text, result);
+        return NextResponse.json({ result: fallback }, { headers: { "Cache-Control": "no-store" } });
+      }
       return NextResponse.json({ error: "ผลลัพธ์จาก Gemini ไม่ตรงตามรูปแบบที่กำหนด กรุณาลองอีกครั้ง" }, { status: 502 });
     }
     return NextResponse.json({ result }, { headers: { "Cache-Control": "no-store" } });
