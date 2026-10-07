@@ -556,7 +556,10 @@ export default function Home() {
         </div>}
         <footer>PromptBridge · คิดร่วมกัน ตรวจสอบได้ · ผลลัพธ์จาก AI ควรตรวจทานก่อนนำไปใช้</footer>
       </> : <section className="landing-card">
-        <div className="landing-brand"><span className="brand-mark">p</span><span>promptbridge <i>AI CONCIERGE</i></span></div>
+        <div className="landing-header">
+          <div className="landing-brand"><span className="brand-mark">p</span><span>promptbridge <i>AI CONCIERGE</i></span></div>
+          <button type="button" className="landing-signout-button" onClick={() => void signOut()}>ออกจากระบบ ↗</button>
+        </div>
         <div className="landing-eyebrow"><span>✳</span> YOUR AI WORKSPACE</div>
         <h1>เรื่องที่อยากจัดการ<br /><em>เริ่มตรงนี้ได้เลย</em></h1>
         <p className="landing-subtitle">พิมพ์สิ่งที่ต้องการเหมือนคุยกับ chatbot<br className="desktop-break" /> Supervisor จะถามเพิ่ม แล้วส่งคำตอบหรือไฟล์กลับมาให้</p>
